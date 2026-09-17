@@ -157,7 +157,15 @@ class PlaywrightFetcher:
     User-Agent -- a real browser engine presents a genuine fingerprint.
     """
 
-    def __init__(self, headless: bool, user_agent: str, timeout: float, max_retries: int):
+    def __init__(
+        self,
+        headless: bool,
+        user_agent: str,
+        timeout: float,
+        max_retries: int,
+        storage_state_path: str | None = None,
+        challenge_timeout: float = 180.0,
+    ):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -165,6 +173,10 @@ class PlaywrightFetcher:
                 "Playwright is required for the playwright engine/fallback but isn't "
                 "installed. Run:\n  pip install playwright\n  playwright install chromium"
             ) from exc
+
+        self.headless = headless
+        self.storage_state_path = storage_state_path
+        self.challenge_timeout = challenge_timeout
 
         self._playwright = sync_playwright().start()
         try:
@@ -180,11 +192,19 @@ class PlaywrightFetcher:
                 raise
             LOG.info("Default Playwright Chromium unavailable; using %s instead", fallback_path)
             self._browser = self._playwright.chromium.launch(headless=headless, executable_path=fallback_path)
+
+        # Reuse a previously saved session (cookies from a manually-solved
+        # challenge) if we have one, so a solve doesn't have to be repeated
+        # on every run while it's still valid.
+        has_saved_state = bool(storage_state_path) and os.path.exists(storage_state_path)
         self._context = self._browser.new_context(
             user_agent=user_agent,
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
+            storage_state=storage_state_path if has_saved_state else None,
         )
+        if has_saved_state:
+            LOG.info("Loaded saved browser session from %s", storage_state_path)
         # Headless Chromium exposes navigator.webdriver=true by default,
         # which is a common, trivial bot-detection signal; hide it.
         self._context.add_init_script(
@@ -193,6 +213,39 @@ class PlaywrightFetcher:
         self._page = self._context.new_page()
         self.timeout = timeout
         self.max_retries = max_retries
+
+    def _save_session(self) -> None:
+        if self.storage_state_path:
+            os.makedirs(os.path.dirname(self.storage_state_path) or ".", exist_ok=True)
+            self._context.storage_state(path=self.storage_state_path)
+            LOG.info("Saved browser session (cookies) to %s for future runs", self.storage_state_path)
+
+    def _wait_for_manual_solve(self, url: str) -> str | None:
+        """Wait for a human to clear a challenge/CAPTCHA in the visible window.
+
+        Crucially, this does NOT call page.goto() again -- reloading would
+        wipe out a CAPTCHA the person is in the middle of solving. It just
+        polls the already-loaded page's content until real player data shows
+        up (or the timeout elapses), then persists the resulting session.
+        """
+        LOG.warning(
+            "Got a 403/challenge for %s. A browser window is open -- please solve any "
+            "CAPTCHA/challenge shown there now. Waiting up to %ds without reloading the page.",
+            url, self.challenge_timeout,
+        )
+        deadline = time.time() + self.challenge_timeout
+        while time.time() < deadline:
+            time.sleep(2)
+            try:
+                html = self._page.content()
+            except Exception:
+                continue
+            if PLAYER_LINK_RE.search(html):
+                LOG.info("Challenge cleared for %s", url)
+                self._save_session()
+                return html
+        LOG.warning("Timed out after %ds waiting for a manual solve on %s", self.challenge_timeout, url)
+        return None
 
     def fetch(self, url: str) -> str | None:
         attempt = 0
@@ -209,10 +262,23 @@ class PlaywrightFetcher:
                 continue
 
             status = response.status if response else None
-            if status == 200:
-                return self._page.content()
+            html = self._page.content() if status == 200 else None
 
-            if status in (403, 429):
+            # A 200 JS-challenge/interstitial page looks like success at the
+            # HTTP level but has no player data yet -- treat it the same as
+            # an explicit 403/429 below.
+            is_challenge = status in (403, 429) or (status == 200 and not PLAYER_LINK_RE.search(html or ""))
+
+            if status == 200 and not is_challenge:
+                return html
+
+            if is_challenge:
+                if not self.headless:
+                    solved_html = self._wait_for_manual_solve(url)
+                    if solved_html is not None:
+                        return solved_html
+                    continue  # timed out waiting; reload and try again
+
                 wait = min(120, 5 * (2 ** attempt))
                 LOG.warning(
                     "Got HTTP %s for %s via Playwright (attempt %d/%d), backing off %ds",
@@ -381,13 +447,13 @@ def run(args: argparse.Namespace) -> int:
             LOG.warning("Requests probe failed (%s); falling back to Playwright headless browser", exc)
             engine = "playwright"
         else:
-            if probe_resp.status_code == 200:
+            if probe_resp.status_code == 200 and PLAYER_LINK_RE.search(probe_resp.text):
                 engine = "requests"
                 bootstrap_html = probe_resp.text
                 LOG.info("Plain HTTP requests work against this site; using the requests engine")
             else:
                 LOG.warning(
-                    "Requests probe got HTTP %d (likely bot-detection/WAF); "
+                    "Requests probe got HTTP %d with no player data (likely bot-detection/WAF); "
                     "falling back to Playwright headless browser",
                     probe_resp.status_code,
                 )
@@ -402,6 +468,8 @@ def run(args: argparse.Namespace) -> int:
             user_agent=args.user_agent,
             timeout=args.timeout,
             max_retries=args.max_retries,
+            storage_state_path=args.storage_state or None,
+            challenge_timeout=args.challenge_timeout,
         )
     else:
         fetcher = RequestsFetcher(session, args.timeout, args.max_retries)
@@ -514,8 +582,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--headed", action="store_true",
-        help="With --engine playwright, show the browser window instead of running headless "
-             "(useful for debugging or solving a one-off challenge manually).",
+        help="With --engine playwright, show the browser window instead of running headless. "
+             "Required if you need to solve a CAPTCHA/challenge by hand: on a 403/challenge page "
+             "the scraper pauses (without reloading) and waits for you to clear it, then saves "
+             "the resulting session via --storage-state.",
+    )
+    parser.add_argument(
+        "--storage-state", default="output/browser_state.json",
+        help="Where the playwright engine saves/loads browser cookies (default: %(default)s), so "
+             "a manually-solved challenge doesn't need to be repeated on the next run while it's "
+             "still valid. Pass an empty string to disable.",
+    )
+    parser.add_argument(
+        "--challenge-timeout", type=float, default=180.0,
+        help="With --engine playwright --headed, how many seconds to wait for a manual "
+             "CAPTCHA/challenge solve before giving up on that page (default: %(default)s)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose (debug) logging")
     return parser.parse_args(argv)

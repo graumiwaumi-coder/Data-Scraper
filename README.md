@@ -57,8 +57,26 @@ python -m futbin_scraper.scraper --engine requests
 
 The playwright engine only supports `--workers 1` (a single browser tab
 scraping sequentially); passing a higher `--workers` with it is ignored
-with a warning. If you want to watch the browser while it runs (e.g. to
-see whether a one-off challenge needs solving by hand), add `--headed`.
+with a warning.
+
+### Solving a CAPTCHA/challenge by hand
+
+If FUTBIN shows an actual CAPTCHA (not just a plain 403), run with
+`--headed` so you can see and solve it yourself in the real browser window:
+
+```bash
+python -m futbin_scraper.scraper --engine playwright --headed --start-page 1 --end-page 2
+```
+
+When a challenge page shows up, the scraper does **not** reload it (that
+would wipe out a CAPTCHA you're in the middle of solving) -- it just waits
+(up to `--challenge-timeout` seconds, default 180) for you to clear it in
+the window, then continues automatically once real player data appears.
+
+Once solved, the resulting session cookies are saved to `--storage-state`
+(default `output/browser_state.json`) and reused on future runs, so you
+typically only need to solve it once per session lifetime (however long
+FUTBIN's own challenge stays valid for), not on every page or every run.
 
 ## Resuming an interrupted run
 
