@@ -132,6 +132,110 @@ def fetch_page(
     return None
 
 
+class RequestsFetcher:
+    """Fetches pages with a plain HTTP client (fast, but blockable by WAFs
+    that fingerprint the TLS/JS handshake rather than just headers)."""
+
+    def __init__(self, session: requests.Session, timeout: float, max_retries: int):
+        self.session = session
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+    def fetch(self, url: str) -> str | None:
+        return fetch_page(self.session, url, self.timeout, self.max_retries)
+
+    def close(self) -> None:
+        self.session.close()
+
+
+class PlaywrightFetcher:
+    """Fetches pages with a real headless Chromium browser via Playwright.
+
+    Used as a fallback when the target site's anti-bot protection (e.g.
+    Cloudflare) blocks plain HTTP clients with a 403 regardless of headers,
+    since it fingerprints the TLS/JS handshake rather than just the
+    User-Agent -- a real browser engine presents a genuine fingerprint.
+    """
+
+    def __init__(self, headless: bool, user_agent: str, timeout: float, max_retries: int):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise RuntimeError(
+                "Playwright is required for the playwright engine/fallback but isn't "
+                "installed. Run:\n  pip install playwright\n  playwright install chromium"
+            ) from exc
+
+        self._playwright = sync_playwright().start()
+        try:
+            self._browser = self._playwright.chromium.launch(headless=headless)
+        except Exception:
+            # Fall back to an already-installed Chromium binary if the
+            # default Playwright-managed one isn't available (e.g. sandboxed
+            # environments that pre-install a browser and block the
+            # downloader). Harmless no-op path on a normal setup where
+            # `playwright install chromium` succeeded.
+            fallback_path = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH", "/opt/pw-browsers/chromium")
+            if not os.path.exists(fallback_path):
+                raise
+            LOG.info("Default Playwright Chromium unavailable; using %s instead", fallback_path)
+            self._browser = self._playwright.chromium.launch(headless=headless, executable_path=fallback_path)
+        self._context = self._browser.new_context(
+            user_agent=user_agent,
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+        )
+        # Headless Chromium exposes navigator.webdriver=true by default,
+        # which is a common, trivial bot-detection signal; hide it.
+        self._context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        self._page = self._context.new_page()
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+    def fetch(self, url: str) -> str | None:
+        attempt = 0
+        while attempt <= self.max_retries:
+            attempt += 1
+            try:
+                response = self._page.goto(url, timeout=self.timeout * 1000, wait_until="domcontentloaded")
+            except Exception as exc:  # Playwright raises its own error types
+                LOG.warning(
+                    "Playwright navigation error on %s (attempt %d/%d): %s",
+                    url, attempt, self.max_retries, exc,
+                )
+                time.sleep(min(60, 2 ** attempt))
+                continue
+
+            status = response.status if response else None
+            if status == 200:
+                return self._page.content()
+
+            if status in (403, 429):
+                wait = min(120, 5 * (2 ** attempt))
+                LOG.warning(
+                    "Got HTTP %s for %s via Playwright (attempt %d/%d), backing off %ds",
+                    status, url, attempt, self.max_retries, wait,
+                )
+                time.sleep(wait)
+                continue
+
+            LOG.warning(
+                "Unexpected HTTP %s for %s via Playwright (attempt %d/%d)",
+                status, url, attempt, self.max_retries,
+            )
+            time.sleep(min(30, 2 ** attempt))
+
+        LOG.error("Giving up on %s after %d attempts (playwright)", url, self.max_retries)
+        return None
+
+    def close(self) -> None:
+        self._context.close()
+        self._browser.close()
+        self._playwright.stop()
+
+
 def extract_player_links(html: str, base_url: str, page_num: int) -> list[PlayerLink]:
     """Pull every unique player detail-page link out of a listing page.
 
@@ -246,15 +350,9 @@ class ResultWriter:
         self._file.close()
 
 
-def scrape_page(
-    session: requests.Session,
-    base_url: str,
-    page_num: int,
-    timeout: float,
-    max_retries: int,
-) -> tuple[int, list[PlayerLink] | None]:
+def scrape_page(fetcher, base_url: str, page_num: int) -> tuple[int, list[PlayerLink] | None]:
     url = page_url(base_url, page_num)
-    html = fetch_page(session, url, timeout, max_retries)
+    html = fetcher.fetch(url)
     if html is None:
         return page_num, None
     return page_num, extract_player_links(html, base_url, page_num)
@@ -271,10 +369,48 @@ def run(args: argparse.Namespace) -> int:
     start_page = args.start_page
     end_page = args.end_page
 
+    engine = args.engine
+    bootstrap_url = page_url(args.base_url, start_page)
+    bootstrap_html: str | None = None
+
+    if engine == "auto":
+        LOG.info("Probing plain HTTP requests against %s", bootstrap_url)
+        try:
+            probe_resp = session.get(bootstrap_url, timeout=args.timeout)
+        except requests.RequestException as exc:
+            LOG.warning("Requests probe failed (%s); falling back to Playwright headless browser", exc)
+            engine = "playwright"
+        else:
+            if probe_resp.status_code == 200:
+                engine = "requests"
+                bootstrap_html = probe_resp.text
+                LOG.info("Plain HTTP requests work against this site; using the requests engine")
+            else:
+                LOG.warning(
+                    "Requests probe got HTTP %d (likely bot-detection/WAF); "
+                    "falling back to Playwright headless browser",
+                    probe_resp.status_code,
+                )
+                engine = "playwright"
+
+    if engine == "playwright":
+        if args.workers > 1:
+            LOG.warning("--workers > 1 is not supported with the playwright engine; forcing --workers 1")
+            args.workers = 1
+        fetcher = PlaywrightFetcher(
+            headless=not args.headed,
+            user_agent=args.user_agent,
+            timeout=args.timeout,
+            max_retries=args.max_retries,
+        )
+    else:
+        fetcher = RequestsFetcher(session, args.timeout, args.max_retries)
+
+    if bootstrap_html is None:
+        bootstrap_html = fetcher.fetch(bootstrap_url)
+
     if end_page is None:
-        LOG.info("No --end-page given, fetching page 1 to auto-detect the last page number")
-        first_html = fetch_page(session, page_url(args.base_url, 1), args.timeout, args.max_retries)
-        detected = detect_last_page(first_html) if first_html else None
+        detected = detect_last_page(bootstrap_html) if bootstrap_html else None
         end_page = detected or 952
         LOG.info("Using end page %d%s", end_page, " (auto-detected)" if detected else " (fallback default)")
 
@@ -288,6 +424,7 @@ def run(args: argparse.Namespace) -> int:
         LOG.info("Resuming: skipping %d already-completed page(s)", skipped)
     LOG.info("Scraping %d page(s) from %s (pages %d-%d)", len(pages), args.base_url, start_page, end_page)
 
+    total_to_process = len(pages)
     failed_pages: list[int] = []
     total_written = 0
     done_count = 0
@@ -300,21 +437,30 @@ def run(args: argparse.Namespace) -> int:
         total_written += writer.write(links)
         progress.mark_done(page_num)
         done_count += 1
-        if done_count % 25 == 0 or done_count == len(pages):
+        if done_count % 25 == 0 or done_count == total_to_process:
             LOG.info(
                 "Progress: %d/%d pages done, %d player links written so far",
-                done_count, len(pages), total_written,
+                done_count, total_to_process, total_written,
             )
+
+    # The bootstrap fetch above already retrieved start_page's HTML (used to
+    # detect the last page number); reuse it instead of fetching it again.
+    if pages and pages[0] == start_page and bootstrap_html is not None:
+        links = extract_player_links(bootstrap_html, args.base_url, start_page)
+        handle_result(start_page, links)
+        pages = pages[1:]
+        if pages:
+            time.sleep(args.delay + random.uniform(0, args.jitter))
 
     try:
         if args.workers <= 1:
             for page_num in pages:
-                _, links = scrape_page(session, args.base_url, page_num, args.timeout, args.max_retries)
+                _, links = scrape_page(fetcher, args.base_url, page_num)
                 handle_result(page_num, links)
                 time.sleep(args.delay + random.uniform(0, args.jitter))
         else:
             def worker(page_num: int) -> tuple[int, list[PlayerLink] | None]:
-                result = scrape_page(session, args.base_url, page_num, args.timeout, args.max_retries)
+                result = scrape_page(fetcher, args.base_url, page_num)
                 time.sleep(args.delay + random.uniform(0, args.jitter))
                 return result
 
@@ -325,6 +471,7 @@ def run(args: argparse.Namespace) -> int:
                     handle_result(page_num, links)
     finally:
         writer.close()
+        fetcher.close()
 
     if failed_pages:
         failed_path = f"{args.output}.failed_pages.txt"
@@ -356,8 +503,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jitter", type=float, default=1.0, help="Extra random delay (0-jitter seconds) added to --delay (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=20.0, help="Per-request timeout in seconds (default: %(default)s)")
     parser.add_argument("--max-retries", type=int, default=5, help="Max retries per page before giving up on it (default: %(default)s)")
-    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent workers (default: %(default)s, i.e. sequential)")
+    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent workers (default: %(default)s, i.e. sequential). Ignored (forced to 1) with --engine playwright.")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent header to send")
+    parser.add_argument(
+        "--engine", choices=["auto", "requests", "playwright"], default="auto",
+        help="How to fetch pages. 'requests' is a plain, fast HTTP client. 'playwright' drives a "
+             "real headless Chromium browser (needed if the site blocks plain HTTP clients, e.g. "
+             "via Cloudflare). 'auto' (default) probes with requests first and falls back to "
+             "playwright automatically if that gets blocked.",
+    )
+    parser.add_argument(
+        "--headed", action="store_true",
+        help="With --engine playwright, show the browser window instead of running headless "
+             "(useful for debugging or solving a one-off challenge manually).",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose (debug) logging")
     return parser.parse_args(argv)
 

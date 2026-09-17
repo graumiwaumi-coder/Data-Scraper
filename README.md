@@ -10,7 +10,12 @@ them to a CSV file.
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 ```
+
+The `playwright install chromium` step downloads a real headless browser,
+used as an automatic fallback if the site blocks plain HTTP requests (see
+below). It's a one-time setup step.
 
 ## Usage
 
@@ -30,6 +35,30 @@ Output is a CSV with columns: `player_id, name, url, source_page`.
 
 Run `python -m futbin_scraper.scraper --help` for all options (delay,
 timeout, retries, concurrency, user agent, etc).
+
+## Bot-detection fallback (Cloudflare / 403s)
+
+FUTBIN blocks plain HTTP clients with a 403, regardless of User-Agent,
+because it fingerprints the TLS/JS handshake rather than just the headers.
+By default (`--engine auto`) the scraper first probes with a fast plain
+HTTP client; if that gets blocked, it automatically switches to a real
+headless Chromium browser (via Playwright) for the rest of the run, which
+presents a genuine browser fingerprint and gets through.
+
+You can also force one or the other:
+
+```bash
+# Skip the probe, always use the headless browser
+python -m futbin_scraper.scraper --engine playwright
+
+# Skip the probe, always use plain HTTP (fails fast if blocked)
+python -m futbin_scraper.scraper --engine requests
+```
+
+The playwright engine only supports `--workers 1` (a single browser tab
+scraping sequentially); passing a higher `--workers` with it is ignored
+with a warning. If you want to watch the browser while it runs (e.g. to
+see whether a one-off challenge needs solving by hand), add `--headed`.
 
 ## Resuming an interrupted run
 
